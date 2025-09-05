@@ -10,8 +10,9 @@ from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from skimage.metrics import structural_similarity as ssim_metric, peak_signal_noise_ratio as psnr_metric
 
-from transformers import CLIPModel, CLIPProcessor, AutoModelForCausalLM, AutoTokenizer
-
+from transformers import (
+    CLIPModel, CLIPProcessor, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+)
 from models.restormer_volterra_film import RestormerVolterraFiLM
 from models.vision_llm_adapter import VisionToLLMAdapter
 from models.llm_condition_head import LLMToCondition
@@ -38,31 +39,55 @@ def compute_psnr(pred, gt):
 
 # ---------------- Main Training ---------------- #
 def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
-         save_dir="E:/CLVR_Restore/checkpoints", lambda_aux=0.2, log_interval=50):
+         save_dir="E:/CLVR_Restore/checkpoints", lambda_aux=0.2,
+         log_interval=50, llm_choice="mistral"):
+    """
+    llm_choice: "opt" | "llama2" | "mistral" | "qwen"
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(save_dir, exist_ok=True)
 
     # 1. CLIP Vision Encoder
-    clip_model = CLIPModel.from_pretrained(
-        "openai/clip-vit-base-patch16",
-        use_safetensors=True  # ✅ safetensors 강제
-    ).vision_model.to(device)
+    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16").vision_model.to(device)
     clip_model.eval()
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
     clip_dim = clip_model.config.hidden_size
 
-    # 2. LLM (OPT small for debug; replace with LLaMA/Mistral for real exp)
-    llm_model = AutoModelForCausalLM.from_pretrained(
-        "facebook/opt-125m",
-        dtype=torch.float16,
-        device_map="auto",
+    # 2. LLM 선택 (bnb 4bit 적용)
+    if llm_choice == "opt":
+        model_name = "facebook/opt-125m"
+    elif llm_choice == "llama2":
+        model_name = "meta-llama/Llama-2-7b-chat-hf"
+    elif llm_choice == "mistral":
+        model_name = "mistralai/Mistral-7B-Instruct-v0.2"
+    elif llm_choice == "qwen":
+        model_name = "Qwen/Qwen-7B-Chat"
+    else:
+        raise ValueError(f"Unknown llm_choice: {llm_choice}")
+
+    print(f"⚡ Loading LLM (bnb 4bit): {model_name}")
+
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
     )
-    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", use_fast=True)
+
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=quant_config,
+        device_map="auto"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+    # ✅ Gradient checkpointing (VRAM 절약)
     llm_model.gradient_checkpointing_enable()
     llm_dim = llm_model.config.hidden_size
 
+    # ✅ Stage 2/3에서 LoRA 적용
     if stage in [2, 3]:
-        llm_model = apply_lora_to_llm(llm_model)  # ✅ LoRA 적용
+        llm_model = apply_lora_to_llm(llm_model)
 
     # 3. Bridge & Modules
     vision_to_llm = VisionToLLMAdapter(clip_dim=clip_dim, llm_dim=llm_dim).to(device)
@@ -81,48 +106,41 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
         params = list(restorer.parameters()) + list(vision_to_llm.parameters()) + list(llm_to_cond.parameters()) + list(aux_cls.parameters())
         lr = lr * 0.1
 
-    optimizer = torch.optim.Adam(params, lr=lr)
+    optimizer = torch.optim.AdamW(params, lr=lr)
     scaler = GradScaler("cuda")
 
     # 5. Dataset
-    datasets = get_train_datasets(limit=160)
+    datasets = get_train_datasets(limit=160, with_labels=True)  # ✅ 라벨 포함
     train_dataset = ConcatDataset(datasets)
     dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # ---------------- Training Loop ---------------- #
     for epoch in range(1, epochs+1):
-        print(f"\n🚀 Stage {stage} Epoch {epoch}/{epochs}")
+        print(f"\n🚀 Stage {stage} Epoch {epoch}/{epochs} | LLM: {llm_choice}")
         pbar = tqdm(dataloader, desc=f"[Stage {stage}] Epoch {epoch}/{epochs}", leave=True)
 
-        for step, (img, gt) in enumerate(pbar, start=1):
+        for step, batch in enumerate(pbar, start=1):
+            img, gt, type_label, strength_label = batch
             img, gt = img.to(device), gt.to(device)
+            type_label, strength_label = type_label.to(device), strength_label.to(device)
 
             # CLIP embeddings
             pil_imgs = [T.ToPILImage()(i.cpu()) for i in img]
             inputs = processor(images=pil_imgs, return_tensors="pt").to(device)
-
             with torch.no_grad():
-                e_clip = clip_model(**inputs).pooler_output  # float32
+                e_clip = clip_model(**inputs).pooler_output
+            vision_embed = vision_to_llm(e_clip).to(dtype=torch.float32)
 
-            # ✅ Projection은 float32, 이후 half 변환
-            vision_embed = vision_to_llm(e_clip.to(torch.float32))
-            vision_embed = vision_embed.to(dtype=torch.float16)
-
-            # LLM input (prefix + embed)
-            prefix = "Distortion type reasoning:"
+            # LLM input (prompt + embed)
+            prefix = "Describe the distortion types and severity (rain, blur, noise, snow):"
             prefix_ids = tokenizer(prefix, return_tensors="pt").input_ids.to(device)
             prefix_emb = llm_model.get_input_embeddings()(prefix_ids)
             prefix_emb = prefix_emb.expand(img.size(0), -1, -1).contiguous()
             combined = torch.cat([prefix_emb, vision_embed.unsqueeze(1)], dim=1)
 
             with autocast("cuda"):
-                out = llm_model(inputs_embeds=combined)
-
-                # logits: [B, T, Vocab] → projection 전 hidden
-                # 내부 embedding 레이어를 다시 호출해서 hidden으로 변환
-                last_token_logits = out.logits[:, -1, :]  # [B, V]
-                h_llm = llm_model.get_input_embeddings()(last_token_logits.argmax(dim=-1))
-
+                out = llm_model(inputs_embeds=combined, output_hidden_states=True)
+                h_llm = out.hidden_states[-1][:, -1, :]  # [B, D]
 
                 # z for FiLM
                 z = llm_to_cond(h_llm.to(dtype=torch.float32))
@@ -133,12 +151,10 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
                 psnr_val = compute_psnr(pred.clamp(0, 1), gt.clamp(0, 1))
                 rest_loss = F.l1_loss(pred, gt) + (1 - ssim_val) * 0.1
 
-                # Auxiliary classification loss (dummy labels for now)
+                # Auxiliary classification loss
                 type_logits, strength_logits = aux_cls(h_llm)
-                fake_type_labels = torch.zeros(img.size(0), dtype=torch.long, device=device)
-                fake_strength_labels = torch.zeros(img.size(0), dtype=torch.long, device=device)
-                aux_loss = F.cross_entropy(type_logits, fake_type_labels) + \
-                           F.cross_entropy(strength_logits, fake_strength_labels)
+                aux_loss = F.cross_entropy(type_logits, type_label) + \
+                           F.cross_entropy(strength_logits, strength_label)
 
                 loss = rest_loss + lambda_aux * aux_loss
 
@@ -150,11 +166,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
             # Explainability 출력
             if step % log_interval == 0:
                 try:
-                    gen_ids = llm_model.generate(
-                        inputs_embeds=combined,
-                        max_new_tokens=15,
-                        do_sample=False
-                    )
+                    gen_ids = llm_model.generate(inputs_embeds=combined, max_new_tokens=20, do_sample=False)
                     decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
                     print(f"\n🔎 Explainability: {decoded}")
                 except Exception as e:
@@ -168,7 +180,6 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
                 "ssim": f"{ssim_val:.4f}"
             })
 
-        # ---- Save ckpt ----
         ckpt_path = os.path.join(save_dir, f"stage{stage}_epoch{epoch}_ssim{ssim_val:.4f}_psnr{psnr_val:.2f}.pth")
         torch.save({
             "epoch": epoch,
@@ -182,6 +193,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
 
 
 if __name__ == "__main__":
-    main(stage=1, epochs=2, batch_size=1)
-    main(stage=2, epochs=2, batch_size=1)
-    main(stage=3, epochs=1, batch_size=1)
+    # 디버깅은 opt (소형), 논문 실험은 mistral/llama2/qwen
+    main(stage=1, epochs=2, batch_size=1, llm_choice="mistral")
+    main(stage=2, epochs=2, batch_size=1, llm_choice="mistral")
+    main(stage=3, epochs=1, batch_size=1, llm_choice="mistral")
