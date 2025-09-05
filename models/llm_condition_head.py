@@ -1,5 +1,3 @@
-# → LLM hidden → z
-# llm_condition_head.py
 import torch
 import torch.nn as nn
 
