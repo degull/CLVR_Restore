@@ -1,5 +1,4 @@
-# train_clvr_restore.py
-import sys, os
+import sys, os, random
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
 
 import torch
@@ -37,12 +36,125 @@ def compute_psnr(pred, gt):
     return torch.tensor(sum(vals) / len(vals))
 
 
+# ---------------- Prompt Pool ---------------- #
+PROMPT_LIST = [
+    # --- General description ---
+    "Describe the distortion types and severity (rain, snow, blur, noise, jpeg, haze, low-light, color shift).",
+    "Identify the present artifacts and classify each distortion with a severity level.",
+    "Which distortions are visible? Indicate type and severity rating.",
+
+    # --- Paraphrasing variants ---
+    "List all distortions in the image and mark their intensity (light, medium, heavy).",
+    "Detect artifacts: rain / snow / blur / noise / jpeg / haze / low-light / color. Rate severity.",
+    "Classify the degradations present in the input and provide a severity label for each.",
+
+    # --- Multi-task prompts ---
+    "Task 1: Detect distortion categories (rain, snow, blur, noise, jpeg, haze, low-light, color).\n"
+    "Task 2: Rate each distortion from 0 (none) to 2 (strong).",
+    "Step 1: Identify all visible distortions.\nStep 2: Assess their severity (low/medium/high).",
+    "Perform two subtasks: (a) recognize distortion types, (b) classify severity.",
+
+    # --- Severity-specific ---
+    "Rain or snow intensity: light / medium / heavy. Blur or noise: mild / strong.",
+    "For each artifact (rain, snow, blur, noise, jpeg, haze, low-light, color), assign severity: none / low / medium / high.",
+    "Classify degradation strength: weak / moderate / severe for each present distortion.",
+
+    # --- Explicit scoring ---
+    "Rate distortions on a scale of 0 (none), 1 (mild), 2 (moderate), 3 (severe).",
+    "Provide a severity score (0–3) for each distortion type detected.",
+    "Assign numeric ratings to distortions: rain, snow, blur, noise, jpeg, haze, low-light, color.",
+
+    # --- Focused reasoning ---
+    "Which distortions dominate the image quality? Explain type and severity.",
+    "Describe whether rain/snow/blur/noise artifacts are light, medium, or strong.",
+    "Give a short reasoning: which distortions affect this image the most and how severe are they?",
+
+    # --- Open-ended reasoning ---
+    "Explain the main degradations in the image, listing type and strength.",
+    "Identify artifacts and provide both category labels and severity estimates.",
+    "What kinds of distortions exist, and how severe is each (low/medium/high)?"
+]
+
+def get_prompt(mode="random", step=0):
+    """Return a prompt string"""
+    if mode == "fixed":
+        return PROMPT_LIST[0]
+    elif mode == "cycle":
+        return PROMPT_LIST[step % len(PROMPT_LIST)]
+    elif mode == "random":
+        return random.choice(PROMPT_LIST)
+    else:
+        raise ValueError(f"Unknown prompt mode: {mode}")
+
+
+# ---------------- Stage3 Finetuning Strategy ---------------- #
+def configure_stage3_strategy(restorer, strategy="balanced", base_lr=1e-4):
+    """
+    Configure which blocks to unfreeze in Stage3
+    strategy: "generalization" | "fidelity" | "balanced"
+    """
+    # 전체 freeze 초기화
+    for p in restorer.parameters():
+        p.requires_grad = False
+
+    param_groups = []
+
+    if strategy == "generalization":
+        # Encoder + Latent
+        for m in [restorer.encoder1, restorer.encoder2, restorer.encoder3, restorer.latent]:
+            for p in m.parameters():
+                p.requires_grad = True
+        param_groups.append({"params": restorer.encoder1.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.encoder2.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.encoder3.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.latent.parameters(), "lr": base_lr})
+
+    elif strategy == "fidelity":
+        # Decoder + Refinement
+        for m in [restorer.decoder1, restorer.decoder2, restorer.decoder3, restorer.refinement]:
+            for p in m.parameters():
+                p.requires_grad = True
+        param_groups.append({"params": restorer.decoder1.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.decoder2.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.decoder3.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.refinement.parameters(), "lr": base_lr})
+
+    elif strategy == "balanced":
+        # Encoder + Decoder full, Latent 50%, Refinement full
+        for m in [restorer.encoder1, restorer.encoder2, restorer.encoder3,
+                  restorer.decoder1, restorer.decoder2, restorer.decoder3,
+                  restorer.refinement]:
+            for p in m.parameters():
+                p.requires_grad = True
+        # latent 절반 freeze
+        latent_params = list(restorer.latent.parameters())
+        n = len(latent_params)
+        for i, p in enumerate(latent_params):
+            if i < n // 2:  # 앞 절반 freeze
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
+
+        param_groups.append({"params": restorer.encoder1.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.decoder1.parameters(), "lr": base_lr})
+        param_groups.append({"params": restorer.refinement.parameters(), "lr": base_lr})
+        param_groups.append({"params": [p for p in latent_params if p.requires_grad], "lr": base_lr * 0.5})
+
+    else:
+        raise ValueError(f"Unknown Stage3 strategy: {strategy}")
+
+    return param_groups
+
+
 # ---------------- Main Training ---------------- #
 def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
          save_dir="E:/CLVR_Restore/checkpoints", lambda_aux=0.2,
-         log_interval=50, llm_choice="mistral"):
+         log_interval=50, llm_choice="mistral", prompt_mode="random",
+         stage3_strategy="balanced"):
     """
     llm_choice: "opt" | "llama2" | "mistral" | "qwen"
+    prompt_mode: "fixed" | "random" | "cycle"
+    stage3_strategy: "generalization" | "fidelity" | "balanced"
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(save_dir, exist_ok=True)
@@ -99,24 +211,36 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
     if stage == 1:
         for p in llm_model.parameters(): p.requires_grad = False
         params = list(restorer.parameters())
+        optimizer = torch.optim.AdamW(params, lr=lr)
+
     elif stage == 2:
         for p in restorer.parameters(): p.requires_grad = False
         params = list(vision_to_llm.parameters()) + list(llm_to_cond.parameters()) + list(aux_cls.parameters())
-    else:  # Stage 3
-        params = list(restorer.parameters()) + list(vision_to_llm.parameters()) + list(llm_to_cond.parameters()) + list(aux_cls.parameters())
-        lr = lr * 0.1
+        optimizer = torch.optim.AdamW(params, lr=lr)
 
-    optimizer = torch.optim.AdamW(params, lr=lr)
+    else:  # Stage 3
+        param_groups = configure_stage3_strategy(restorer, strategy=stage3_strategy, base_lr=lr*0.1)
+
+        # vision adapter, condition head, aux classifier는 항상 학습
+        for p in vision_to_llm.parameters(): p.requires_grad = True
+        for p in llm_to_cond.parameters(): p.requires_grad = True
+        for p in aux_cls.parameters(): p.requires_grad = True
+        param_groups.append({"params": vision_to_llm.parameters(), "lr": lr})
+        param_groups.append({"params": llm_to_cond.parameters(), "lr": lr})
+        param_groups.append({"params": aux_cls.parameters(), "lr": lr})
+
+        optimizer = torch.optim.AdamW(param_groups)
+
     scaler = GradScaler("cuda")
 
     # 5. Dataset
-    datasets = get_train_datasets(limit=160, with_labels=True)  # ✅ 라벨 포함
+    datasets = get_train_datasets(limit=160, with_labels=True)
     train_dataset = ConcatDataset(datasets)
     dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # ---------------- Training Loop ---------------- #
     for epoch in range(1, epochs+1):
-        print(f"\n🚀 Stage {stage} Epoch {epoch}/{epochs} | LLM: {llm_choice}")
+        print(f"\n🚀 Stage {stage} Epoch {epoch}/{epochs} | LLM: {llm_choice} | Prompt mode: {prompt_mode} | Strategy: {stage3_strategy}")
         pbar = tqdm(dataloader, desc=f"[Stage {stage}] Epoch {epoch}/{epochs}", leave=True)
 
         for step, batch in enumerate(pbar, start=1):
@@ -131,12 +255,19 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
                 e_clip = clip_model(**inputs).pooler_output
             vision_embed = vision_to_llm(e_clip).to(dtype=torch.float32)
 
-            # LLM input (prompt + embed)
-            prefix = "Describe the distortion types and severity (rain, blur, noise, snow):"
-            prefix_ids = tokenizer(prefix, return_tensors="pt").input_ids.to(device)
+            # ✅ Prompt 다양화
+            # ✅ Prompt 다양화: 문자열 → 토큰화 → 임베딩
+            prompt_str = get_prompt(mode=prompt_mode, step=step)
+            prefix_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(device)
             prefix_emb = llm_model.get_input_embeddings()(prefix_ids)
             prefix_emb = prefix_emb.expand(img.size(0), -1, -1).contiguous()
+
+            # vision_embed 붙이기
             combined = torch.cat([prefix_emb, vision_embed.unsqueeze(1)], dim=1)
+
+            # ✅ attention_mask도 길이를 맞춰줌
+            attn_mask = torch.ones(combined.shape[:2], dtype=torch.long, device=device)
+
 
             with autocast("cuda"):
                 out = llm_model(inputs_embeds=combined, output_hidden_states=True)
@@ -166,11 +297,20 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
             # Explainability 출력
             if step % log_interval == 0:
                 try:
-                    gen_ids = llm_model.generate(inputs_embeds=combined, max_new_tokens=20, do_sample=False)
+                    with torch.amp.autocast("cuda", enabled=False):  # ✅ 최신 API
+                        gen_ids = llm_model.generate(
+                            inputs_embeds=combined.to(dtype=llm_model.dtype),
+                            attention_mask=attn_mask,
+                            max_new_tokens=20,
+                            do_sample=False,
+                            pad_token_id=tokenizer.eos_token_id
+                        )
+
                     decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
                     print(f"\n🔎 Explainability: {decoded}")
                 except Exception as e:
                     print(f"[Explain log error] {e}")
+
 
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
@@ -180,7 +320,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
                 "ssim": f"{ssim_val:.4f}"
             })
 
-        ckpt_path = os.path.join(save_dir, f"stage{stage}_epoch{epoch}_ssim{ssim_val:.4f}_psnr{psnr_val:.2f}.pth")
+        ckpt_path = os.path.join(save_dir, f"stage{stage}_epoch{epoch}_mode{prompt_mode}_strat{stage3_strategy}_ssim{ssim_val:.4f}_psnr{psnr_val:.2f}.pth")
         torch.save({
             "epoch": epoch,
             "restorer": restorer.state_dict(),
@@ -192,8 +332,11 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
         print(f"✓ Saved checkpoint: {ckpt_path}")
 
 
+# ---------------- Ablation Runner ---------------- #
 if __name__ == "__main__":
-    # 디버깅은 opt (소형), 논문 실험은 mistral/llama2/qwen
-    main(stage=1, epochs=2, batch_size=1, llm_choice="mistral")
-    main(stage=2, epochs=2, batch_size=1, llm_choice="mistral")
-    main(stage=3, epochs=1, batch_size=1, llm_choice="mistral")
+    for mode in ["fixed", "random", "cycle"]:
+        for strat in ["generalization", "fidelity", "balanced"]:
+            print(f"\n\n===== 🔬 Running Ablation with prompt mode: {mode}, strategy: {strat} =====\n")
+            main(stage=1, epochs=2, batch_size=1, llm_choice="mistral", prompt_mode=mode, stage3_strategy=strat)
+            main(stage=2, epochs=2, batch_size=1, llm_choice="mistral", prompt_mode=mode, stage3_strategy=strat)
+            main(stage=3, epochs=1, batch_size=1, llm_choice="mistral", prompt_mode=mode, stage3_strategy=strat)
