@@ -334,9 +334,24 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
 
 # ---------------- Ablation Runner ---------------- #
 if __name__ == "__main__":
+    # Ablation: prompt mode × Stage3 전략
     for mode in ["fixed", "random", "cycle"]:
         for strat in ["generalization", "fidelity", "balanced"]:
-            print(f"\n\n===== 🔬 Running Ablation with prompt mode: {mode}, strategy: {strat} =====\n")
-            main(stage=1, epochs=2, batch_size=1, llm_choice="mistral", prompt_mode=mode, stage3_strategy=strat)
-            main(stage=2, epochs=2, batch_size=1, llm_choice="mistral", prompt_mode=mode, stage3_strategy=strat)
-            main(stage=3, epochs=1, batch_size=1, llm_choice="mistral", prompt_mode=mode, stage3_strategy=strat)
+            print(f"\n\n===== 🔬 Running Full Experiment with prompt mode: {mode}, strategy: {strat} =====\n")
+            
+            # Stage1: backbone 학습 (20 epoch)
+            main(stage=1, epochs=20, batch_size=1,
+                 llm_choice="mistral", prompt_mode=mode,
+                 stage3_strategy=strat)
+
+            # Stage2: adapter 학습 (10 epoch)
+            main(stage=2, epochs=10, batch_size=1,
+                 llm_choice="mistral", prompt_mode=mode,
+                 stage3_strategy=strat)
+
+            # Stage3: joint fine-tuning (10 epoch)
+            main(stage=3, epochs=10, batch_size=1,
+                 llm_choice="mistral", prompt_mode=mode,
+                 stage3_strategy=strat)
+
+# LLM (예: Mistral-7B) 이 get_prompt() 로 전달받은 프롬프트에 대해 추론(Generate) 한 결과
