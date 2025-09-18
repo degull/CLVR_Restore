@@ -72,8 +72,22 @@ PROMPT_LIST = [
     # --- Open-ended reasoning ---
     "Explain the main degradations in the image, listing type and strength.",
     "Identify artifacts and provide both category labels and severity estimates.",
-    "What kinds of distortions exist, and how severe is each (low/medium/high)?"
+    "What kinds of distortions exist, and how severe is each (low/medium/high)?",
+
+    # --- 🔥 Added: Fixed output format for consistency ---
+    "Output format: {distortion: severity, ...}. Example: {rain:2, blur:1, noise:0, jpeg:0, haze:0, low-light:1, color:0}",
+
+    # --- 🔥 Added: Multi-distortion emphasis ---
+    "The image may contain multiple distortions simultaneously. Detect and rate each distortion type individually.",
+
+    # --- 🔥 Added: No-distortion case ---
+    "If no distortion is visible, output: {all:0}",
+
+    # --- 🔥 Added: Task-driven context ---
+    "You are a restoration assistant. Your task is to classify distortions before restoration. "
+    "Output format: {distortion: severity}. Example: {rain:3, blur:1, noise:0, jpeg:0, haze:0, low-light:0, color:0}"
 ]
+
 
 def get_prompt(mode="random", step=0):
     """Return a prompt string"""
