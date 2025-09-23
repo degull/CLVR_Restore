@@ -38,33 +38,36 @@ def compute_psnr(pred, gt):
 
 # ---------------- Prompt Pool ---------------- #
 PROMPT_LIST = [
-    # --- General description ---
+    # --- LLM이 해야 할 작업을 명확히 제시 ---
     "Describe the distortion types and severity (rain, snow, blur, noise, jpeg, haze, low-light, color shift).",
     "Identify the present artifacts and classify each distortion with a severity level.",
     "Which distortions are visible? Indicate type and severity rating.",
 
-    # --- Paraphrasing variants ---
+    # --- 문장 표현 다양화
+    # 같은 의미를 다양한 표현으로 변형 ---
     "List all distortions in the image and mark their intensity (light, medium, heavy).",
     "Detect artifacts: rain / snow / blur / noise / jpeg / haze / low-light / color. Rate severity.",
     "Classify the degradations present in the input and provide a severity label for each.",
 
-    # --- Multi-task prompts ---
+    # --- 복합 작업 지시
+    # 모델이 다단계 reasoning에 익숙해지도록 유도 ---
     "Task 1: Detect distortion categories (rain, snow, blur, noise, jpeg, haze, low-light, color).\n"
     "Task 2: Rate each distortion from 0 (none) to 2 (strong).",
     "Step 1: Identify all visible distortions.\nStep 2: Assess their severity (low/medium/high).",
     "Perform two subtasks: (a) recognize distortion types, (b) classify severity.",
 
-    # --- Severity-specific ---
+    # --- 왜곡별 강도 표현 ---
     "Rain or snow intensity: light / medium / heavy. Blur or noise: mild / strong.",
     "For each artifact (rain, snow, blur, noise, jpeg, haze, low-light, color), assign severity: none / low / medium / high.",
     "Classify degradation strength: weak / moderate / severe for each present distortion.",
 
-    # --- Explicit scoring ---
+    # --- 숫자 점수화 ---
     "Rate distortions on a scale of 0 (none), 1 (mild), 2 (moderate), 3 (severe).",
     "Provide a severity score (0–3) for each distortion type detected.",
     "Assign numeric ratings to distortions: rain, snow, blur, noise, jpeg, haze, low-light, color.",
 
-    # --- Focused reasoning ---
+    # --- 주요 왜곡 강조
+    # 단순 분류가 아니라 우선순위 reasoning까지 가능하도록 확장 ---
     "Which distortions dominate the image quality? Explain type and severity.",
     "Describe whether rain/snow/blur/noise artifacts are light, medium, or strong.",
     "Give a short reasoning: which distortions affect this image the most and how severe are they?",
@@ -173,13 +176,13 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1. CLIP Vision Encoder
+    ### 1. CLIP Vision Encoder
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16").vision_model.to(device)
     clip_model.eval()
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
     clip_dim = clip_model.config.hidden_size
 
-    # 2. LLM 선택 (bnb 4bit 적용)
+    # LLM 선택 (bnb 4bit 적용)
     if llm_choice == "opt":
         model_name = "facebook/opt-125m"
     elif llm_choice == "llama2":
@@ -200,6 +203,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
         bnb_4bit_compute_dtype=torch.float16
     )
 
+    ### 3. LLM with LoRA
     llm_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quant_config,
@@ -207,21 +211,20 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-    # ✅ Gradient checkpointing (VRAM 절약)
     llm_model.gradient_checkpointing_enable()
     llm_dim = llm_model.config.hidden_size
 
-    # ✅ Stage 2/3에서 LoRA 적용
     if stage in [2, 3]:
         llm_model = apply_lora_to_llm(llm_model)
 
-    # 3. Bridge & Modules
+    ### 2. VisionToLLMAdapter
     vision_to_llm = VisionToLLMAdapter(clip_dim=clip_dim, llm_dim=llm_dim).to(device)
+    ### 4. LLMToCondition (MLP → z)
     llm_to_cond   = LLMToCondition(llm_dim=llm_dim, cond_dim=128).to(device)
+    ### 5. FiLM Injection into ReVolT Backbone
     restorer      = RestormerVolterraFiLM(cond_dim=128).to(device)
     aux_cls       = AuxClassifier(llm_dim=llm_dim).to(device)
 
-    # Trainable params per stage
     if stage == 1:
         for p in llm_model.parameters(): p.requires_grad = False
         params = list(restorer.parameters())
@@ -235,7 +238,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
     else:  # Stage 3
         param_groups = configure_stage3_strategy(restorer, strategy=stage3_strategy, base_lr=lr*0.1)
 
-        # vision adapter, condition head, aux classifier는 항상 학습
+        # vision adapter, condition head, aux classifier는 항상 학습 
         for p in vision_to_llm.parameters(): p.requires_grad = True
         for p in llm_to_cond.parameters(): p.requires_grad = True
         for p in aux_cls.parameters(): p.requires_grad = True
@@ -247,7 +250,6 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
 
     scaler = GradScaler("cuda")
 
-    # 5. Dataset
     datasets = get_train_datasets(limit=160, with_labels=True)
     train_dataset = ConcatDataset(datasets)
     dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -269,7 +271,6 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
                 e_clip = clip_model(**inputs).pooler_output
             vision_embed = vision_to_llm(e_clip).to(dtype=torch.float32)
 
-            # ✅ Prompt 다양화
             # ✅ Prompt 다양화: 문자열 → 토큰화 → 임베딩
             prompt_str = get_prompt(mode=prompt_mode, step=step)
             prefix_ids = tokenizer(prompt_str, return_tensors="pt").input_ids.to(device)
@@ -287,7 +288,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
                 out = llm_model(inputs_embeds=combined, output_hidden_states=True)
                 h_llm = out.hidden_states[-1][:, -1, :]  # [B, D]
 
-                # z for FiLM
+                ### 4. LLMToCondition (MLP → z)
                 z = llm_to_cond(h_llm.to(dtype=torch.float32))
                 pred = restorer(img, z)
 
@@ -311,7 +312,7 @@ def main(stage=1, epochs=5, batch_size=1, lr=1e-4,
             # Explainability 출력
             if step % log_interval == 0:
                 try:
-                    with torch.amp.autocast("cuda", enabled=False):  # ✅ 최신 API
+                    with torch.amp.autocast("cuda", enabled=False):
                         gen_ids = llm_model.generate(
                             inputs_embeds=combined.to(dtype=llm_model.dtype),
                             attention_mask=attn_mask,
