@@ -1,12 +1,17 @@
 # restormer_volterra_film.py
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from volterra_layer import VolterraLayer2D
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .volterra_layer import VolterraLayer2D
 
 
-# ---------------- FiLM ---------------- #
+
+# ============================================================
+#  FiLM Modules
+# ============================================================
 class FiLM(nn.Module):
     def forward(self, x, gamma, beta):
         gamma = gamma.unsqueeze(-1).unsqueeze(-1)
@@ -15,13 +20,17 @@ class FiLM(nn.Module):
 
 
 class FiLMGenerator(nn.Module):
-    def __init__(self, cond_dim, feat_dim):
+    """Condition vector → (gamma, beta) 생성기"""
+    def __init__(self, cond_dim, feat_dim, scale=0.05):  # ✅ 안정화 스케일 추가
         super().__init__()
         self.to_gamma = nn.Linear(cond_dim, feat_dim)
         self.to_beta = nn.Linear(cond_dim, feat_dim)
+        self.scale = scale
 
     def forward(self, z):
-        return self.to_gamma(z), self.to_beta(z)
+        gamma = self.to_gamma(z) * self.scale
+        beta = self.to_beta(z) * self.scale
+        return gamma, beta
 
 
 class FiLMLayer(nn.Module):
@@ -35,7 +44,9 @@ class FiLMLayer(nn.Module):
         return self.film(x, gamma, beta)
 
 
-# ---------------- LayerNorm ---------------- #
+# ============================================================
+#  Layer Normalization
+# ============================================================
 class BiasFreeLayerNorm(nn.Module):
     def __init__(self, normalized_shape):
         super().__init__()
@@ -64,7 +75,9 @@ def LayerNorm(normalized_shape, bias=False):
     return WithBiasLayerNorm(normalized_shape) if bias else BiasFreeLayerNorm(normalized_shape)
 
 
-# ---------------- GDFN ---------------- #
+# ============================================================
+#  Gated-Dconv FeedForward Network (GDFN)
+# ============================================================
 class GDFN(nn.Module):
     def __init__(self, dim, expansion_factor, bias):
         super().__init__()
@@ -86,7 +99,9 @@ class GDFN(nn.Module):
         return x
 
 
-# ---------------- MDTA ---------------- #
+# ============================================================
+#  Multi-Dconv Head Transposed Attention (MDTA)
+# ============================================================
 class MDTA(nn.Module):
     def __init__(self, dim, num_heads, bias):
         super().__init__()
@@ -112,7 +127,9 @@ class MDTA(nn.Module):
         return self.project_out(out)
 
 
-# ---------------- Transformer Block ---------------- #
+# ============================================================
+#  Transformer Block
+# ============================================================
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_expansion_factor, bias,
                  LayerNorm_type, volterra_rank, cond_dim=128):
@@ -133,7 +150,9 @@ class TransformerBlock(nn.Module):
         return x
 
 
-# ---------------- Encoder / Decoder ---------------- #
+# ============================================================
+#  Encoder / Decoder
+# ============================================================
 class Encoder(nn.Module):
     def __init__(self, dim, depth, **kwargs):
         super().__init__()
@@ -156,7 +175,9 @@ class Decoder(nn.Module):
         return x
 
 
-# ---------------- Downsample / Upsample ---------------- #
+# ============================================================
+#  Downsample / Upsample
+# ============================================================
 class Downsample(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -179,11 +200,13 @@ class Upsample(nn.Module):
         return self.body(x)
 
 
-# ---------------- Restormer + Volterra + FiLM ---------------- #
+# ============================================================
+#  Restormer + Volterra + FiLM Main Network
+# ============================================================
 class RestormerVolterraFiLM(nn.Module):
     def __init__(self, in_channels=3, out_channels=3, dim=48,
-                 num_blocks=[4,6,6,8], num_refinement_blocks=4,
-                 heads=[1,2,4,8], ffn_expansion_factor=2.66,
+                 num_blocks=[4, 6, 6, 8], num_refinement_blocks=4,
+                 heads=[1, 2, 4, 8], ffn_expansion_factor=2.66,
                  bias=False, LayerNorm_type='WithBias',
                  volterra_rank=4, cond_dim=128):
         super().__init__()
@@ -196,36 +219,36 @@ class RestormerVolterraFiLM(nn.Module):
                                 volterra_rank=volterra_rank, cond_dim=cond_dim)
         self.down1 = Downsample(dim)
 
-        self.encoder2 = Encoder(dim*2, num_blocks[1], num_heads=heads[1],
+        self.encoder2 = Encoder(dim * 2, num_blocks[1], num_heads=heads[1],
                                 ffn_expansion_factor=ffn_expansion_factor,
                                 bias=bias, LayerNorm_type=LayerNorm_type,
                                 volterra_rank=volterra_rank, cond_dim=cond_dim)
-        self.down2 = Downsample(dim*2)
+        self.down2 = Downsample(dim * 2)
 
-        self.encoder3 = Encoder(dim*4, num_blocks[2], num_heads=heads[2],
+        self.encoder3 = Encoder(dim * 4, num_blocks[2], num_heads=heads[2],
                                 ffn_expansion_factor=ffn_expansion_factor,
                                 bias=bias, LayerNorm_type=LayerNorm_type,
                                 volterra_rank=volterra_rank, cond_dim=cond_dim)
-        self.down3 = Downsample(dim*4)
+        self.down3 = Downsample(dim * 4)
 
-        self.latent = Encoder(dim*8, num_blocks[3], num_heads=heads[3],
+        self.latent = Encoder(dim * 8, num_blocks[3], num_heads=heads[3],
                               ffn_expansion_factor=ffn_expansion_factor,
                               bias=bias, LayerNorm_type=LayerNorm_type,
                               volterra_rank=volterra_rank, cond_dim=cond_dim)
 
-        self.up3 = Upsample(dim*8, dim*4)
-        self.decoder3 = Decoder(dim*4, num_blocks[2], num_heads=heads[2],
+        self.up3 = Upsample(dim * 8, dim * 4)
+        self.decoder3 = Decoder(dim * 4, num_blocks[2], num_heads=heads[2],
                                 ffn_expansion_factor=ffn_expansion_factor,
                                 bias=bias, LayerNorm_type=LayerNorm_type,
                                 volterra_rank=volterra_rank, cond_dim=cond_dim)
 
-        self.up2 = Upsample(dim*4, dim*2)
-        self.decoder2 = Decoder(dim*2, num_blocks[1], num_heads=heads[1],
+        self.up2 = Upsample(dim * 4, dim * 2)
+        self.decoder2 = Decoder(dim * 2, num_blocks[1], num_heads=heads[1],
                                 ffn_expansion_factor=ffn_expansion_factor,
                                 bias=bias, LayerNorm_type=LayerNorm_type,
                                 volterra_rank=volterra_rank, cond_dim=cond_dim)
 
-        self.up1 = Upsample(dim*2, dim)
+        self.up1 = Upsample(dim * 2, dim)
         self.decoder1 = Decoder(dim, num_blocks[0], num_heads=heads[0],
                                 ffn_expansion_factor=ffn_expansion_factor,
                                 bias=bias, LayerNorm_type=LayerNorm_type,
@@ -245,6 +268,12 @@ class RestormerVolterraFiLM(nn.Module):
         return up_tensor + skip_tensor
 
     def forward(self, x, z):
+        # ✅ 입력 정규화 [0,1] → [-1,1]
+        x = x * 2 - 1
+
+        # ✅ CLIP z normalization (zero-mean, unit-var)
+        z = (z - z.mean(dim=-1, keepdim=True)) / (z.std(dim=-1, keepdim=True) + 1e-6)
+
         x1 = self.patch_embed(x)
         x2 = self.encoder1(x1, z)
         x3 = self.encoder2(self.down1(x2), z)
@@ -255,17 +284,20 @@ class RestormerVolterraFiLM(nn.Module):
         x8 = self.decoder1(self._pad_and_add(self.up1(x7), x2), z)
         x9 = self.refinement(x8, z)
         out = self.output(x9 + x1)
+
+        # ✅ 안정화 및 출력 복원 [-1,1] → [0,1]
+        out = torch.tanh(out)
+        out = (out + 1) / 2
         return out
 
 
-# ✅ 테스트
+# ============================================================
+#  Sanity Test
+# ============================================================
 if __name__ == '__main__':
     model = RestormerVolterraFiLM()
-    dummy_img = torch.randn(1, 3, 256, 256)
-    dummy_z = torch.randn(1, 128)  # condition vector
+    dummy_img = torch.rand(1, 3, 256, 256)
+    dummy_z = torch.randn(1, 128)
     out = model(dummy_img, dummy_z)
-    print(out.shape)
-
-
-# cd E:/CLVR_Restore
-# python -m models.restormer_volterra_film
+    print("Output shape:", out.shape)
+    print("Output range:", out.min().item(), "→", out.max().item())
